@@ -1,9 +1,4 @@
 services:
   - type: web
     name: smspanel
-    runtime: php
-    buildCommand: ""
-    startCommand: php -S 0.0.0.0:$PORT
-    envVars:
-      - key: PORT
-        sync: false
+    runtime: docker
