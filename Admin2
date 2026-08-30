@@ -3,7 +3,7 @@
 $bot_token   = "8998188048:AAFLvJ7xkydWpTPlskOIM4tiCwmVGPAbOZA"; 
 $smm_api_url = "https://my.smmgen.com/api/v2";                 
 $smm_api_key = "2e53b57414dc722db3e2e2f9aaf723dc";             
-$admin_id    = 8888289198;                                    
+$admin_id    = 8248792819;                                    
 
 // Create Data Directory
 $data_dir = __DIR__ . '/data';
