@@ -4,4 +4,4 @@ WORKDIR /app
 
 COPY . /app
 
-CMD ["php", "-d", "display_errors=1", "bot.php"]
+CMD php -d display_errors=1 -S 0.0.0.0:$PORTPORT
