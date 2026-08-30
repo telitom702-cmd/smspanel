@@ -2,3 +2,4 @@ services:
   - type: web
     name: smspanel
     runtime: docker
+    healthCheckPath: /bot.php
