@@ -1,1 +1,1024 @@
+<?php
+// ==================== [ CONFIGURATION ] ====================
+$bot_token   = "8766260416:AAEbwMNKxbd0x1e_2FJbho7osbXC6oXRvwE"; 
+$smm_api_url = "https://my.smmgen.com/api/v2";                 
+$smm_api_key = "2e53b57414dc722db3e2e2f9aaf723dc";             
+$admin_id    = 8888289198;                                    
 
+// Create Data Directory
+$data_dir = __DIR__ . '/data';
+if (!file_exists($data_dir)) {
+    mkdir($data_dir, 0777, true);
+}
+
+// Domain API Endpoint URL
+$my_domain_api_url = "https://" . ($_SERVER['HTTP_HOST'] ?? 'yourdomain.com') . dirname($_SERVER['SCRIPT_NAME']) . "/api.php";
+
+// ==================== [ TELEGRAM INPUT ] ====================
+$content = file_get_contents("php://input");
+$update  = json_decode($content, true);
+if (!$update) { exit(); }
+
+$chat_id       = $update['message']['chat']['id'] ?? $update['callback_query']['message']['chat']['id'] ?? null;
+$text          = trim($update['message']['text'] ?? '');
+$callback_data = $update['callback_query']['data'] ?? null;
+$cb_message_id = $update['callback_query']['message']['message_id'] ?? null;
+$cb_id         = $update['callback_query']['id'] ?? null;
+$first_name    = $update['message']['from']['first_name'] ?? $update['callback_query']['from']['first_name'] ?? 'User';
+
+if (!$chat_id) { exit(); }
+
+// ==================== [ DATABASE & SETTINGS HELPERS ] ====================
+function getSettings() {
+    global $data_dir;
+    $file = "$data_dir/settings.json";
+    $default = [
+        'ref_enabled'        => false,
+        'ref_bonus'          => 0.05,
+        'admin_username'     => 'admin',
+        'force_join_enabled' => false,
+        'force_channel_id'   => '',
+        'force_channel_link' => '',
+        'btn_per_row'        => 2, // 1 or 2
+        'btn_active'         => [
+            'services'  => true,
+            'new_order' => true,
+            'balance'   => true,
+            'deposit'   => true,
+            'api'       => true,
+            'status'    => true,
+            'refill'    => true,
+            'referral'  => true
+        ]
+    ];
+    return file_exists($file) ? array_merge($default, json_decode(file_get_contents($file), true) ?: []) : $default;
+}
+
+function saveSettings($settings) {
+    global $data_dir;
+    file_put_contents("$data_dir/settings.json", json_encode($settings, JSON_PRETTY_PRINT));
+}
+
+function getUsers() {
+    global $data_dir;
+    $file = "$data_dir/users.json";
+    return file_exists($file) ? (json_decode(file_get_contents($file), true) ?: []) : [];
+}
+
+function registerUser($chat_id, $first_name, $referrer_id = null) {
+    global $data_dir;
+    $file = "$data_dir/users.json";
+    $users = getUsers();
+    
+    if (!isset($users[$chat_id])) {
+        $users[$chat_id] = [
+            'name'         => $first_name,
+            'balance'      => 0.00,
+            'joined'       => date('Y-m-d H:i:s'),
+            'api_key'      => bin2hex(random_bytes(16)),
+            'referred_by'  => null,
+            'ref_count'    => 0,
+            'ref_earnings' => 0.00
+        ];
+
+        $settings = getSettings();
+        if ($referrer_id && $referrer_id != $chat_id && isset($users[$referrer_id]) && !empty($settings['ref_enabled'])) {
+            $bonus = floatval($settings['ref_bonus']);
+            $users[$chat_id]['referred_by'] = $referrer_id;
+            $users[$referrer_id]['balance'] += $bonus;
+            $users[$referrer_id]['ref_count'] += 1;
+            $users[$referrer_id]['ref_earnings'] += $bonus;
+
+            sendMessage($referrer_id, "🎉 <b>New Referral Joined!</b>\n\nUser <b>{$first_name}</b> joined using your referral link. You earned <b>\${$bonus}</b>!");
+        }
+
+        file_put_contents($file, json_encode($users, JSON_PRETTY_PRINT));
+    } elseif (empty($users[$chat_id]['api_key'])) {
+        $users[$chat_id]['api_key'] = bin2hex(random_bytes(16));
+        file_put_contents($file, json_encode($users, JSON_PRETTY_PRINT));
+    }
+}
+
+function getUserBalance($chat_id) {
+    $users = getUsers();
+    return $users[$chat_id]['balance'] ?? 0.00;
+}
+
+function updateUserBalance($chat_id, $amount) {
+    global $data_dir;
+    $file = "$data_dir/users.json";
+    $users = getUsers();
+    if (isset($users[$chat_id])) {
+        $users[$chat_id]['balance'] += $amount;
+        if ($users[$chat_id]['balance'] < 0) $users[$chat_id]['balance'] = 0;
+        file_put_contents($file, json_encode($users, JSON_PRETTY_PRINT));
+        return $users[$chat_id]['balance'];
+    }
+    return false;
+}
+
+function getServiceConfigs() {
+    global $data_dir;
+    $file = "$data_dir/service_configs.json";
+    return file_exists($file) ? (json_decode(file_get_contents($file), true) ?: []) : [];
+}
+
+function saveServiceConfigs($configs) {
+    global $data_dir;
+    $file = "$data_dir/service_configs.json";
+    file_put_contents($file, json_encode($configs, JSON_PRETTY_PRINT));
+}
+
+function getUserState($chat_id) {
+    global $data_dir;
+    $file = "$data_dir/user_$chat_id.json";
+    return file_exists($file) ? (json_decode(file_get_contents($file), true) ?: ['step' => 'none']) : ['step' => 'none'];
+}
+
+function setUserState($chat_id, $data) {
+    global $data_dir;
+    file_put_contents("$data_dir/user_$chat_id.json", json_encode($data));
+}
+
+function getPlatformName($service_name, $category_name) {
+    $text = strtolower($service_name . " " . $category_name);
+    if (strpos($text, 'tiktok') !== false) return 'TikTok';
+    if (strpos($text, 'youtube') !== false) return 'YouTube';
+    if (strpos($text, 'facebook') !== false || strpos($text, 'fb') !== false) return 'Facebook';
+    if (strpos($text, 'telegram') !== false) return 'Telegram';
+    if (strpos($text, 'instagram') !== false) return 'Instagram';
+    return 'Others';
+}
+
+function sendMessage($chat_id, $text, $keyboard = null, $message_id = null) {
+    global $bot_token;
+    $method = $message_id ? "editMessageText" : "sendMessage";
+    $url = "https://api.telegram.org/bot{$bot_token}/{$method}";
+    
+    $post_fields = [
+        'chat_id'    => $chat_id,
+        'text'       => $text,
+        'parse_mode' => 'HTML'
+    ];
+    if ($message_id) { $post_fields['message_id'] = $message_id; }
+    if ($keyboard)   { $post_fields['reply_markup'] = json_encode($keyboard); }
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $post_fields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false
+    ]);
+    $res = curl_exec($ch);
+    curl_close($ch);
+    return $res;
+}
+
+function answerCb($cb_id, $msg = "", $show_alert = false) {
+    global $bot_token;
+    if (!$cb_id) return;
+    $url = "https://api.telegram.org/bot{$bot_token}/answerCallbackQuery";
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => ['callback_query_id' => $cb_id, 'text' => $msg, 'show_alert' => $show_alert],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false
+    ]);
+    curl_exec($ch);
+    curl_close($ch);
+}
+
+function callSmmGenApi($action, $params = []) {
+    global $smm_api_url, $smm_api_key;
+    $params['key'] = $smm_api_key;
+    $params['action'] = $action;
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $smm_api_url,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query($params),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false
+    ]);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    return json_decode($response, true);
+}
+
+// 📌 FORCE JOIN MEMBER CHECK FUNCTION
+function isSubscribed($chat_id, $channel_id) {
+    global $bot_token;
+    if (empty($channel_id)) return true;
+    
+    $channel_id = trim($channel_id);
+    
+    $url = "https://api.telegram.org/bot{$bot_token}/getChatMember?chat_id=" . urlencode($channel_id) . "&user_id=" . $chat_id;
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false
+    ]);
+    $res = json_decode(curl_exec($ch), true);
+    curl_close($ch);
+
+    if (isset($res['ok']) && $res['ok'] === true) {
+        $status = $res['result']['status'] ?? '';
+        return in_array($status, ['creator', 'administrator', 'member']);
+    }
+
+    return false;
+}
+
+// ==================== [ DYNAMIC MAIN KEYBOARD BUILDER ] ====================
+function getMainMenuKeyboard($chat_id, $admin_id, $settings) {
+    $active_btns = $settings['btn_active'] ?? [];
+    $per_row     = intval($settings['btn_per_row'] ?? 2);
+
+    $all_map = [
+        'services'  => "🛒 Services",
+        'new_order' => "➕ New Order",
+        'balance'   => "💰 My Balance",
+        'deposit'   => "💳 Deposit",
+        'api'       => "🔑 My API",
+        'status'    => "🔍 Order Status",
+        'refill'    => "♻️ Refill Order"
+    ];
+
+    if (!empty($settings['ref_enabled'])) {
+        $all_map['referral'] = "👥 Refer & Earn";
+    }
+
+    $active_list = [];
+    foreach ($all_map as $key => $label) {
+        if (!isset($active_btns[$key]) || $active_btns[$key] === true) {
+            $active_list[] = ['text' => $label];
+        }
+    }
+
+    if (empty($active_list)) {
+        $active_list = [
+            ['text' => "🛒 Services"],
+            ['text' => "➕ New Order"],
+            ['text' => "💰 My Balance"],
+            ['text' => "💳 Deposit"]
+        ];
+    }
+
+    $keyboard = [];
+    if ($per_row == 1) {
+        foreach ($active_list as $b) {
+            $keyboard[] = [$b];
+        }
+    } else {
+        $chunks = array_chunk($active_list, 2);
+        foreach ($chunks as $chunk) {
+            $keyboard[] = $chunk;
+        }
+    }
+
+    if ($chat_id == $admin_id) {
+        $keyboard[] = [['text' => "⚙️ Admin Panel"]];
+    }
+
+    return ['keyboard' => $keyboard, 'resize_keyboard' => true];
+}
+
+$user_state    = getUserState($chat_id);
+$settings      = getSettings();
+$main_keyboard = getMainMenuKeyboard($chat_id, $admin_id, $settings);
+
+// ==================== [ FORCE JOIN CHECK ] ====================
+// নোট: আপনি এডমিন আইডি দিয়ে টেস্ট করতে চাইলে "&& $chat_id != $admin_id" কেটে দিয়ে টেস্ট করবেন।
+if (!empty($settings['force_join_enabled']) && !empty($settings['force_channel_id']) && $chat_id != $admin_id) {
+    if (!isSubscribed($chat_id, $settings['force_channel_id'])) {
+        if ($callback_data == 'check_force_join') {
+            answerCb($cb_id, "⚠️ You have not joined the channel yet!", true);
+        }
+
+        $channel_link = !empty($settings['force_channel_link']) ? $settings['force_channel_link'] : "https://t.me/" . ltrim($settings['force_channel_id'], '@');
+        
+        $join_kb = [
+            'inline_keyboard' => [
+                [['text' => "📢 Join Channel", 'url' => $channel_link]],
+                [['text' => "🔄 Verify Membership", 'callback_data' => 'check_force_join']]
+            ]
+        ];
+
+        sendMessage($chat_id, "⚠️ <b>Access Denied!</b>\n\nYou must join our official updates channel to use this bot.\n\nClick the button below to join, then click <b>Verify Membership</b>.", $join_kb);
+        exit();
+    }
+}
+
+if ($callback_data == 'check_force_join') {
+    answerCb($cb_id, "✅ Verified! Welcome.");
+    sendMessage($chat_id, "✅ <b>Thank you for joining!</b> You can now use the bot.", $main_keyboard);
+    exit();
+}
+
+// ==================== [ START / RESET COMMAND ] ====================
+if (strpos($text, '/start') === 0 || $text == "❌ Cancel / Reset") {
+    setUserState($chat_id, ['step' => 'none']);
+    
+    $parts = explode(' ', $text);
+    $referrer_id = (isset($parts[1]) && strpos($parts[1], 'ref_') === 0) ? intval(str_replace('ref_', '', $parts[1])) : null;
+
+    registerUser($chat_id, $first_name, $referrer_id);
+    $user_balance = getUserBalance($chat_id);
+    
+    $msg = "👋 <b>Welcome to SMM Services Bot!</b>\n\n";
+    $msg .= "👤 <b>User:</b> {$first_name}\n";
+    $msg .= "💰 <b>Your Balance:</b> \$" . number_format($user_balance, 2) . "\n\n";
+    $msg .= "Select an option from the menu below:";
+    
+    sendMessage($chat_id, $msg, $main_keyboard);
+    exit();
+}
+
+registerUser($chat_id, $first_name);
+
+// ==================== [ 💳 DEPOSIT MENU ] ====================
+if ($text == "💳 Deposit") {
+    $admin_user = ltrim($settings['admin_username'], '@');
+    $dep_kb = [
+        'inline_keyboard' => [
+            [['text' => "👨‍💻 Contact Admin for Deposit", 'url' => "https://t.me/{$admin_user}"]]
+        ]
+    ];
+
+    $msg = "💳 <b>Deposit Funds</b>\n\n";
+    $msg .= "To add funds to your account balance, please contact our Admin directly.\n\n";
+    $msg .= "🔹 <b>Accepted Payment Methods:</b> Manual Mobile Banking, Crypto, Cards.\n";
+    $msg .= "🔹 <b>Instant Credit:</b> Send your Chat ID (<code>{$chat_id}</code>) to Admin after payment.\n\n";
+    $msg .= "Click the button below to message Admin:";
+
+    sendMessage($chat_id, $msg, $dep_kb);
+    exit();
+}
+
+// ==================== [ 🔑 MY API MENU ] ====================
+if ($text == "🔑 My API") {
+    $users = getUsers();
+    $api_key = $users[$chat_id]['api_key'] ?? 'N/A';
+
+    $api_kb = [
+        'inline_keyboard' => [
+            [['text' => "🔄 Regenerate New API Key", 'callback_data' => 'usr_regen_api']]
+        ]
+    ];
+
+    $msg = "🔑 <b>Your API Integration Details</b>\n\n";
+    $msg .= "Use this API to connect your own Telegram Bot or Website with our panel:\n\n";
+    $msg .= "🌐 <b>API Endpoint URL:</b>\n<code>{$my_domain_api_url}</code>\n\n";
+    $msg .= "🔑 <b>Your Secret API Key:</b>\n<code>{$api_key}</code>\n\n";
+    $msg .= "💡 <i>Keep your API key private. When orders come from your Child Bot, charges will be automatically deducted from your account balance here.</i>";
+
+    sendMessage($chat_id, $msg, $api_kb);
+    exit();
+}
+
+if ($callback_data == 'usr_regen_api') {
+    answerCb($cb_id, "New API Key Generated!");
+    $users = getUsers();
+    $new_key = bin2hex(random_bytes(16));
+    $users[$chat_id]['api_key'] = $new_key;
+    file_put_contents("$data_dir/users.json", json_encode($users, JSON_PRETTY_PRINT));
+
+    $msg = "🔑 <b>Your API Integration Details</b>\n\n";
+    $msg .= "🌐 <b>API Endpoint URL:</b>\n<code>{$my_domain_api_url}</code>\n\n";
+    $msg .= "🔑 <b>Your New API Key:</b>\n<code>{$new_key}</code>\n\n";
+    $msg .= "✅ Key updated successfully!";
+
+    $api_kb = ['inline_keyboard' => [[['text' => "🔄 Regenerate New API Key", 'callback_data' => 'usr_regen_api']]]];
+    sendMessage($chat_id, $msg, $api_kb, $cb_message_id);
+    exit();
+}
+
+// ==================== [ ⚙️ ADMIN PANEL ] ====================
+if ($text == "⚙️ Admin Panel" && $chat_id == $admin_id) {
+    $ref_status_txt = !empty($settings['ref_enabled']) ? "🟢 Active" : "🔴 Inactive";
+    $fj_status_txt  = !empty($settings['force_join_enabled']) ? "🟢 Active" : "🔴 Inactive";
+    
+    $inline_admin = [
+        'inline_keyboard' => [
+            [['text' => "⚙️ Manage Auto API Services", 'callback_data' => 'adm_cat_select']],
+            [['text' => "🔘 Button Control (Show/Hide & Layout)", 'callback_data' => 'adm_btn_control']],
+            [['text' => "💳 Add User Balance", 'callback_data' => 'adm_add_bal_start']],
+            [['text' => "📢 Force Join Channel [{$fj_status_txt}]", 'callback_data' => 'adm_fj_settings']],
+            [['text' => "👤 Set Admin Username (@{$settings['admin_username']})", 'callback_data' => 'adm_set_username']],
+            [['text' => "👥 Referral System [{$ref_status_txt}]", 'callback_data' => 'adm_ref_settings']],
+            [['text' => "📢 Broadcast Message", 'callback_data' => 'adm_broadcast']],
+            [['text' => "💵 SMM Provider Balance", 'callback_data' => 'adm_balance']]
+        ]
+    ];
+    sendMessage($chat_id, "⚙️ <b>Admin Control Panel</b>", $inline_admin);
+    exit();
+}
+
+// ==================== [ ADMIN CALLBACK ACTIONS ] ====================
+if ($callback_data && $chat_id == $admin_id) {
+
+    // 🔘 BUTTON CONTROL MENU
+    if ($callback_data == 'adm_btn_control') {
+        answerCb($cb_id);
+        $st = getSettings();
+        $btns = $st['btn_active'] ?? [];
+        $layout = $st['btn_per_row'] ?? 2;
+
+        $b_map = [
+            'services'  => "🛒 Services",
+            'new_order' => "➕ New Order",
+            'balance'   => "💰 Balance",
+            'deposit'   => "💳 Deposit",
+            'api'       => "🔑 API",
+            'status'    => "🔍 Status",
+            'refill'    => "♻️ Refill",
+            'referral'  => "👥 Referral"
+        ];
+
+        $inline = [];
+        $inline[] = [['text' => "📐 Layout: {$layout} Per Row (Click to Switch)", 'callback_data' => 'adm_btn_layout_toggle']];
+
+        foreach ($b_map as $key => $name) {
+            $is_on = ($btns[$key] ?? true) ? "🟢 ON" : "🔴 OFF";
+            $inline[] = [['text' => "{$name}: [{$is_on}]", 'callback_data' => "adm_btntoggle_{$key}"]];
+        }
+
+        sendMessage($chat_id, "🔘 <b>Menu Button Control</b>\n\nToggle buttons ON/OFF or change keyboard layout structure:", ['inline_keyboard' => $inline], $cb_message_id);
+        exit();
+    }
+
+    if ($callback_data == 'adm_btn_layout_toggle') {
+        answerCb($cb_id, "Layout Updated!");
+        $st = getSettings();
+        $st['btn_per_row'] = ($st['btn_per_row'] == 1) ? 2 : 1;
+        saveSettings($st);
+        $callback_data = 'adm_btn_control';
+    }
+
+    if (strpos($callback_data, 'adm_btntoggle_') === 0) {
+        answerCb($cb_id, "Button Status Updated!");
+        $key = str_replace('adm_btntoggle_', '', $callback_data);
+        $st = getSettings();
+        $st['btn_active'][$key] = !($st['btn_active'][$key] ?? true);
+        saveSettings($st);
+        $callback_data = 'adm_btn_control';
+    }
+
+    // Force Join Settings
+    if ($callback_data == 'adm_fj_settings') {
+        answerCb($cb_id);
+        $st = getSettings();
+        $status_txt = !empty($st['force_join_enabled']) ? "🟢 Enabled" : "🔴 Disabled";
+
+        $fj_kb = [
+            'inline_keyboard' => [
+                [['text' => (!empty($st['force_join_enabled']) ? "🔴 Turn OFF Force Join" : "🟢 Turn ON Force Join"), 'callback_data' => 'adm_fj_toggle']],
+                [['text' => "✏️ Set Channel Username", 'callback_data' => 'adm_fj_setid']],
+                [['text' => "✏️ Set Channel Link", 'callback_data' => 'adm_fj_setlink']]
+            ]
+        ];
+
+        $msg = "📢 <b>Force Join Settings</b>\n\nStatus: {$status_txt}\nChannel ID: <code>{$st['force_channel_id']}</code>\nLink: {$st['force_channel_link']}";
+        sendMessage($chat_id, $msg, $fj_kb, $cb_message_id);
+        exit();
+    }
+
+    if ($callback_data == 'adm_fj_toggle') {
+        answerCb($cb_id);
+        $st = getSettings();
+        $st['force_join_enabled'] = !$st['force_join_enabled'];
+        saveSettings($st);
+        $callback_data = 'adm_fj_settings';
+    }
+
+    if ($callback_data == 'adm_fj_setid') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_fj_id']);
+        sendMessage($chat_id, "✏️ Enter <b>Channel Username</b> (including @):\nExample: <code>@MySmmChannel</code>");
+        exit();
+    }
+
+    if ($callback_data == 'adm_fj_setlink') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_fj_link']);
+        sendMessage($chat_id, "✏️ Enter <b>Channel Invite Link</b>:\nExample: <code>https://t.me/MySmmChannel</code>");
+        exit();
+    }
+
+    if ($callback_data == 'adm_set_username') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_username']);
+        sendMessage($chat_id, "✏️ Enter <b>Admin Telegram Username</b> (without @):\nExample: <code>JohnDoe</code>");
+        exit();
+    }
+
+    if ($callback_data == 'adm_ref_settings') {
+        answerCb($cb_id);
+        $st = getSettings();
+        $status_txt = !empty($st['ref_enabled']) ? "🟢 Enabled" : "🔴 Disabled";
+        $bonus = $st['ref_bonus'];
+
+        $ref_kb = [
+            'inline_keyboard' => [
+                [['text' => (!empty($st['ref_enabled']) ? "🔴 Turn OFF Referral" : "🟢 Turn ON Referral"), 'callback_data' => 'adm_ref_toggle']],
+                [['text' => "✏️ Change Bonus Amount (\${$bonus})", 'callback_data' => 'adm_ref_setbonus']]
+            ]
+        ];
+
+        $msg = "👥 <b>Referral System Settings</b>\n\nStatus: {$status_txt}\nBonus: \${$bonus}";
+        sendMessage($chat_id, $msg, $ref_kb, $cb_message_id);
+        exit();
+    }
+
+    if ($callback_data == 'adm_ref_toggle') {
+        answerCb($cb_id);
+        $st = getSettings();
+        $st['ref_enabled'] = !$st['ref_enabled'];
+        saveSettings($st);
+        $callback_data = 'adm_ref_settings';
+    }
+
+    if ($callback_data == 'adm_ref_setbonus') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_ref_bonus']);
+        sendMessage($chat_id, "✏️ Enter <b>New Referral Bonus Amount</b>:");
+        exit();
+    }
+
+    if ($callback_data == 'adm_balance') {
+        answerCb($cb_id);
+        $res = callSmmGenApi('balance');
+        $bal = $res['balance'] ?? '0';
+        sendMessage($chat_id, "💳 <b>SMMGen Provider Balance:</b> {$bal} USD");
+        exit();
+    }
+
+    if ($callback_data == 'adm_broadcast') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_broadcast']);
+        sendMessage($chat_id, "📢 Enter Broadcast Message:");
+        exit();
+    }
+
+    if ($callback_data == 'adm_add_bal_start') {
+        answerCb($cb_id);
+        setUserState($chat_id, ['step' => 'adm_awaiting_add_bal']);
+        sendMessage($chat_id, "💳 Enter User Chat ID and Amount:\nExample: <code>123456789 10.50</code>");
+        exit();
+    }
+
+    if ($callback_data == 'adm_cat_select') {
+        answerCb($cb_id);
+        $cat_keyboard = [
+            'inline_keyboard' => [
+                [['text' => "🎵 TikTok", 'callback_data' => 'adm_managecat_TikTok'], ['text' => "📺 YouTube", 'callback_data' => 'adm_managecat_YouTube']],
+                [['text' => "📘 Facebook", 'callback_data' => 'adm_managecat_Facebook'], ['text' => "✈️ Telegram", 'callback_data' => 'adm_managecat_Telegram']],
+                [['text' => "📷 Instagram", 'callback_data' => 'adm_managecat_Instagram'], ['text' => "🌐 Others", 'callback_data' => 'adm_managecat_Others']]
+            ]
+        ];
+        sendMessage($chat_id, "⚙️ <b>Select Category to Manage Services:</b>", $cat_keyboard);
+        exit();
+    }
+
+    if (strpos($callback_data, 'adm_managecat_') === 0) {
+        answerCb($cb_id);
+        $platform = str_replace('adm_managecat_', '', $callback_data);
+        $all_api_services = callSmmGenApi('services');
+        $configs = getServiceConfigs();
+
+        $buttons = [];
+        if (is_array($all_api_services)) {
+            $count = 0;
+            foreach ($all_api_services as $s) {
+                if ($count >= 15) break;
+                $p = getPlatformName($s['name'], $s['category']);
+                if ($p == $platform) {
+                    $srv_id = $s['service'];
+                    $is_active = $configs[$srv_id]['active'] ?? false;
+                    $status_icon = $is_active ? "🟢 Active" : "🔴 Inactive";
+                    $rate = $configs[$srv_id]['rate'] ?? $s['rate'];
+
+                    $row = [
+                        ['text' => "{$status_icon} [ID:{$srv_id}] (\${$rate}) " . substr($s['name'], 0, 15) . "..", 'callback_data' => "adm_toggle_{$srv_id}_{$platform}"],
+                        ['text' => "✏️ Edit", 'callback_data' => "adm_editsrv_{$srv_id}_{$platform}"]
+                    ];
+                    $buttons[] = $row;
+                    $count++;
+                }
+            }
+        }
+        sendMessage($chat_id, "⚙️ <b>{$platform} Management:</b>", ['inline_keyboard' => $buttons]);
+        exit();
+    }
+
+    if (strpos($callback_data, 'adm_toggle_') === 0) {
+        answerCb($cb_id);
+        $parts = explode('_', $callback_data);
+        $srv_id = $parts[2];
+        $configs = getServiceConfigs();
+        $configs[$srv_id]['active'] = !($configs[$srv_id]['active'] ?? false);
+        saveServiceConfigs($configs);
+        sendMessage($chat_id, "⚙️ Status updated for Service #{$srv_id}");
+        exit();
+    }
+
+    if (strpos($callback_data, 'adm_editsrv_') === 0) {
+        answerCb($cb_id);
+        $parts = explode('_', $callback_data);
+        $srv_id = $parts[2];
+        $all_api_services = callSmmGenApi('services');
+        $api_srv = null;
+        foreach ($all_api_services as $s) {
+            if ($s['service'] == $srv_id) { $api_srv = $s; break; }
+        }
+
+        if ($api_srv) {
+            setUserState($chat_id, [
+                'step'    => 'adm_edit_rate',
+                'srv_id'  => $srv_id,
+                'api_min' => $api_srv['min'],
+                'api_max' => $api_srv['max']
+            ]);
+            sendMessage($chat_id, "✏️ Enter <b>New User Rate</b> per 1,000 for Service #{$srv_id}:\nProvider Rate: \${$api_srv['rate']}");
+        }
+        exit();
+    }
+}
+
+// ==================== [ ADMIN INPUT STEP PROCESSING ] ====================
+if ($chat_id == $admin_id) {
+    if ($user_state['step'] == 'adm_awaiting_fj_id') {
+        $st = getSettings();
+        $st['force_channel_id'] = trim($text);
+        saveSettings($st);
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "✅ Force Join Channel ID updated!", $main_keyboard);
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_awaiting_fj_link') {
+        $st = getSettings();
+        $st['force_channel_link'] = trim($text);
+        saveSettings($st);
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "✅ Force Join Channel Link updated!", $main_keyboard);
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_awaiting_username') {
+        $st = getSettings();
+        $st['admin_username'] = trim($text);
+        saveSettings($st);
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "✅ Admin Username updated to @{$text}!", $main_keyboard);
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_awaiting_ref_bonus') {
+        $st = getSettings();
+        $st['ref_bonus'] = floatval($text);
+        saveSettings($st);
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "✅ Referral Bonus updated!", $main_keyboard);
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_awaiting_broadcast') {
+        setUserState($chat_id, ['step' => 'none']);
+        foreach (getUsers() as $uid => $d) { sendMessage($uid, "📢 <b>ANNOUNCEMENT:</b>\n\n" . $text); }
+        sendMessage($chat_id, "✅ Broadcast completed!");
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_awaiting_add_bal') {
+        setUserState($chat_id, ['step' => 'none']);
+        $parts = explode(' ', $text);
+        if (count($parts) >= 2) {
+            $new_bal = updateUserBalance(trim($parts[0]), floatval($parts[1]));
+            sendMessage($chat_id, "✅ Added \${$parts[1]}. New Balance: \${$new_bal}");
+        }
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_edit_rate') {
+        setUserState($chat_id, [
+            'step'    => 'adm_edit_min',
+            'srv_id'  => $user_state['srv_id'],
+            'rate'    => floatval($text),
+            'api_min' => $user_state['api_min'],
+            'api_max' => $user_state['api_max']
+        ]);
+        sendMessage($chat_id, "🔢 Enter <b>Minimum Quantity</b>:");
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_edit_min') {
+        setUserState($chat_id, [
+            'step'    => 'adm_edit_max',
+            'srv_id'  => $user_state['srv_id'],
+            'rate'    => $user_state['rate'],
+            'min'     => intval($text),
+            'api_max' => $user_state['api_max']
+        ]);
+        sendMessage($chat_id, "🔢 Enter <b>Maximum Quantity</b>:");
+        exit();
+    }
+
+    if ($user_state['step'] == 'adm_edit_max') {
+        $srv_id = $user_state['srv_id'];
+        $configs = getServiceConfigs();
+        $configs[$srv_id]['active'] = true;
+        $configs[$srv_id]['rate']   = $user_state['rate'];
+        $configs[$srv_id]['min']    = $user_state['min'];
+        $configs[$srv_id]['max']    = intval($text);
+
+        saveServiceConfigs($configs);
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "✅ Service Saved Successfully!", $main_keyboard);
+        exit();
+    }
+}
+
+// ==================== [ USER REFER & EARN ] ====================
+if ($text == "👥 Refer & Earn") {
+    if (empty($settings['ref_enabled'])) { exit(); }
+    $bot_uname = $update['message']['via_bot']['username'] ?? "YourBot";
+    $ref_link = "https://t.me/{$bot_uname}?start=ref_{$chat_id}";
+    sendMessage($chat_id, "👥 <b>Refer & Earn Link:</b>\n<code>{$ref_link}</code>\n\nReward: \${$settings['ref_bonus']} per invited active user.", $main_keyboard);
+    exit();
+}
+
+// ==================== [ USER CATEGORY & ORDER FLOW ] ====================
+if ($text == "🛒 Services" || $text == "➕ New Order") {
+    $cat_keyboard = [
+        'inline_keyboard' => [
+            [['text' => "🎵 TikTok", 'callback_data' => 'usr_plat_TikTok'], ['text' => "📺 YouTube", 'callback_data' => 'usr_plat_YouTube']],
+            [['text' => "📘 Facebook", 'callback_data' => 'usr_plat_Facebook'], ['text' => "✈️ Telegram", 'callback_data' => 'usr_plat_Telegram']],
+            [['text' => "📷 Instagram", 'callback_data' => 'usr_plat_Instagram'], ['text' => "🌐 Others", 'callback_data' => 'usr_plat_Others']]
+        ]
+    ];
+    sendMessage($chat_id, "📂 <b>Select Social Media Platform:</b>", $cat_keyboard);
+    exit();
+}
+
+if ($callback_data && strpos($callback_data, 'usr_plat_') === 0) {
+    answerCb($cb_id);
+    $platform = str_replace('usr_plat_', '', $callback_data);
+    $all_api_services = callSmmGenApi('services');
+    $configs = getServiceConfigs();
+
+    $subcategories = [];
+    if (is_array($all_api_services)) {
+        foreach ($all_api_services as $s) {
+            if (getPlatformName($s['name'], $s['category']) == $platform) {
+                $srv_id = $s['service'];
+                if (isset($configs[$srv_id]) && !empty($configs[$srv_id]['active'])) {
+                    if (!in_array($s['category'], $subcategories)) {
+                        $subcategories[] = $s['category'];
+                    }
+                }
+            }
+        }
+    }
+
+    if (empty($subcategories)) {
+        sendMessage($chat_id, "❌ No active services available under <b>{$platform}</b> right now.");
+        exit();
+    }
+
+    $buttons = [];
+    $user_state['subcats'] = [];
+    foreach ($subcategories as $sub_cat) {
+        $short_key = substr(md5($sub_cat), 0, 8);
+        $user_state['subcats'][$short_key] = $sub_cat;
+        $buttons[] = [['text' => "📁 " . $sub_cat, 'callback_data' => "usr_subcat_{$short_key}"]];
+    }
+    
+    $user_state['step'] = 'none';
+    setUserState($chat_id, $user_state);
+    sendMessage($chat_id, "📂 <b>Select Category for {$platform}:</b>", ['inline_keyboard' => $buttons]);
+    exit();
+}
+
+if ($callback_data && strpos($callback_data, 'usr_subcat_') === 0) {
+    answerCb($cb_id);
+    $short_key = str_replace('usr_subcat_', '', $callback_data);
+    $subcat_name = $user_state['subcats'][$short_key] ?? null;
+
+    if (!$subcat_name) {
+        sendMessage($chat_id, "⚠️ Session expired. Please select platform again from 🛒 Services.");
+        exit();
+    }
+
+    $all_api_services = callSmmGenApi('services');
+    $configs = getServiceConfigs();
+
+    sendMessage($chat_id, "📋 <b>Active Services in {$subcat_name}:</b>");
+
+    if (is_array($all_api_services)) {
+        foreach ($all_api_services as $s) {
+            if ($s['category'] == $subcat_name) {
+                $srv_id = $s['service'];
+                if (isset($configs[$srv_id]) && !empty($configs[$srv_id]['active'])) {
+                    $user_rate = $configs[$srv_id]['rate'] ?? $s['rate'];
+                    $user_min  = $configs[$srv_id]['min']  ?? $s['min'];
+                    $user_max  = $configs[$srv_id]['max']  ?? $s['max'];
+
+                    $msg = "🆔 <b>Service ID:</b> <code>{$srv_id}</code>\n📌 <b>Service:</b> {$s['name']}\n💵 <b>Rate:</b> \${$user_rate} / 1000\n📊 <b>Min:</b> {$user_min} - <b>Max:</b> {$user_max}";
+                    sendMessage($chat_id, $msg, ['inline_keyboard' => [[['text' => "🛒 Order Now", 'callback_data' => "usr_ord_{$srv_id}"]]]]);
+                }
+            }
+        }
+    }
+    exit();
+}
+
+if ($callback_data && strpos($callback_data, 'usr_ord_') === 0) {
+    answerCb($cb_id);
+    $srv_id = str_replace('usr_ord_', '', $callback_data);
+    $all_api_services = callSmmGenApi('services');
+    $configs = getServiceConfigs();
+
+    $api_srv = null;
+    foreach ($all_api_services as $s) { if ($s['service'] == $srv_id) { $api_srv = $s; break; } }
+
+    if ($api_srv && !empty($configs[$srv_id]['active'])) {
+        setUserState($chat_id, [
+            'step'   => 'usr_awaiting_link',
+            'srv_id' => $srv_id,
+            'rate'   => $configs[$srv_id]['rate'] ?? $api_srv['rate'],
+            'min'    => $configs[$srv_id]['min']  ?? $api_srv['min'],
+            'max'    => $configs[$srv_id]['max']  ?? $api_srv['max'],
+            'name'   => $api_srv['name']
+        ]);
+        sendMessage($chat_id, "🔗 Send your <b>Target Link/URL</b> (Video/Post/Profile Link):");
+    }
+    exit();
+}
+
+if ($user_state['step'] == 'usr_awaiting_link') {
+    setUserState($chat_id, [
+        'step'   => 'usr_awaiting_qty',
+        'srv_id' => $user_state['srv_id'],
+        'link'   => $text,
+        'rate'   => $user_state['rate'],
+        'min'    => $user_state['min'],
+        'max'    => $user_state['max'],
+        'name'   => $user_state['name']
+    ]);
+    sendMessage($chat_id, "🔢 <b>Manual Quantity Input:</b>\n\nEnter the exact number of Likes / Views / Followers / Comments you want:\n\n📊 <i>Allowed Range: Min {$user_state['min']} to Max {$user_state['max']}</i>");
+    exit();
+}
+
+if ($user_state['step'] == 'usr_awaiting_qty') {
+    $qty = intval($text);
+    if ($qty < $user_state['min'] || $qty > $user_state['max']) {
+        sendMessage($chat_id, "⚠️ Invalid quantity! Please enter a number between {$user_state['min']} and {$user_state['max']}:");
+        exit();
+    }
+
+    $total_cost = ($user_state['rate'] / 1000) * $qty;
+    setUserState($chat_id, [
+        'step'       => 'usr_confirm_order',
+        'srv_id'     => $user_state['srv_id'],
+        'link'       => $user_state['link'],
+        'qty'        => $qty,
+        'rate'       => $user_state['rate'],
+        'total_cost' => $total_cost,
+        'name'       => $user_state['name']
+    ]);
+
+    $confirm_kb = [
+        'inline_keyboard' => [
+            [['text' => "📊 Check Amount & Breakdown", 'callback_data' => 'usr_check_amount']],
+            [['text' => "✅ Confirm Order (\$" . number_format($total_cost, 4) . ")", 'callback_data' => 'usr_place_order_now']],
+            [['text' => "❌ Cancel Order", 'callback_data' => 'usr_cancel_order_now']]
+        ]
+    ];
+    
+    $msg = "📋 <b>Order Ready for Confirmation!</b>\n\n";
+    $msg .= "📌 <b>Service:</b> {$user_state['name']}\n";
+    $msg .= "🔢 <b>Entered Quantity:</b> " . number_format($qty) . "\n";
+    $msg .= "💵 <b>Calculated Charge:</b> \$" . number_format($total_cost, 4) . "\n\n";
+    $msg .= "👉 Click <b>📊 Check Amount & Breakdown</b> to view detailed calculation or <b>✅ Confirm Order</b> to place now:";
+
+    sendMessage($chat_id, $msg, $confirm_kb);
+    exit();
+}
+
+// 📊 CHECK AMOUNT BREAKDOWN CALLBACK
+if ($callback_data == 'usr_check_amount' && $user_state['step'] == 'usr_confirm_order') {
+    $qty        = $user_state['qty'];
+    $rate       = $user_state['rate'];
+    $total_cost = $user_state['total_cost'];
+    $my_bal     = getUserBalance($chat_id);
+    $rem_bal    = $my_bal - $total_cost;
+
+    $alert_txt  = "📊 Calculation Breakdown:\n";
+    $alert_txt .= "• Quantity: " . number_format($qty) . "\n";
+    $alert_txt .= "• Rate per 1k: $" . number_format($rate, 4) . "\n";
+    $alert_txt .= "• Total Cost: $" . number_format($total_cost, 4) . "\n";
+    $alert_txt .= "• Your Balance: $" . number_format($my_bal, 4);
+
+    answerCb($cb_id, $alert_txt, true);
+
+    $confirm_kb = [
+        'inline_keyboard' => [
+            [['text' => "✅ Place Order (\$" . number_format($total_cost, 4) . ")", 'callback_data' => 'usr_place_order_now']],
+            [['text' => "❌ Cancel Order", 'callback_data' => 'usr_cancel_order_now']]
+        ]
+    ];
+
+    $msg  = "📊 <b>Detailed Cost Breakdown:</b>\n\n";
+    $msg .= "📌 <b>Service:</b> {$user_state['name']}\n";
+    $msg .= "🔗 <b>Target Link:</b> <code>{$user_state['link']}</code>\n";
+    $msg .= "🔢 <b>Selected Quantity:</b> " . number_format($qty) . "\n";
+    $msg .= "💵 <b>Rate per 1,000:</b> \$" . number_format($rate, 4) . "\n";
+    $msg .= "-------------------------------------\n";
+    $msg .= "💳 <b>Total Payable Amount:</b> \$" . number_format($total_cost, 4) . "\n";
+    $msg .= "💰 <b>Your Current Balance:</b> \$" . number_format($my_bal, 4) . "\n";
+    
+    if ($rem_bal >= 0) {
+        $msg .= "📉 <b>Remaining Balance After Purchase:</b> \$" . number_format($rem_bal, 4) . "\n\n";
+        $msg .= "✅ Everything looks good! Click confirm to complete purchase.";
+    } else {
+        $msg .= "⚠️ <b>Shortage Balance:</b> \$" . number_format(abs($rem_bal), 4) . "\n\n";
+        $msg .= "❌ You do not have enough balance for this order. Please deposit first!";
+    }
+
+    sendMessage($chat_id, $msg, $confirm_kb, $cb_message_id);
+    exit();
+}
+
+if ($callback_data == 'usr_place_order_now' && $user_state['step'] == 'usr_confirm_order') {
+    answerCb($cb_id);
+    $total_cost = $user_state['total_cost'];
+    
+    if (getUserBalance($chat_id) < $total_cost) {
+        setUserState($chat_id, ['step' => 'none']);
+        sendMessage($chat_id, "❌ <b>Insufficient Balance!</b> Required: \$" . number_format($total_cost, 4) . "\n\nPlease click 💳 Deposit to add funds.", $main_keyboard);
+        exit();
+    }
+
+    $res = callSmmGenApi('add', ['service' => $user_state['srv_id'], 'link' => $user_state['link'], 'quantity' => $user_state['qty']]);
+
+    if (isset($res['order'])) {
+        updateUserBalance($chat_id, -$total_cost);
+        $msg = "✅ <b>Order Placed Successfully!</b>\n🆔 <b>Order ID:</b> <code>{$res['order']}</code>\n💳 <b>Cost Deducted:</b> \$" . number_format($total_cost, 4);
+    } else {
+        $msg = "❌ Order Failed: " . ($res['error'] ?? "Unknown provider error");
+    }
+
+    setUserState($chat_id, ['step' => 'none']);
+    sendMessage($chat_id, $msg, $main_keyboard);
+    exit();
+}
+
+if ($callback_data == 'usr_cancel_order_now') {
+    setUserState($chat_id, ['step' => 'none']);
+    sendMessage($chat_id, "❌ Order cancelled.", $main_keyboard);
+    exit();
+}
+
+// 💰 MY BALANCE
+if ($text == "💰 My Balance") {
+    sendMessage($chat_id, "👤 <b>User ID:</b> <code>{$chat_id}</code>\n💰 <b>Current Balance:</b> \$" . number_format(getUserBalance($chat_id), 4), $main_keyboard);
+    exit();
+}
+
+// 🔍 ORDER STATUS
+if ($text == "🔍 Order Status") {
+    setUserState($chat_id, ['step' => 'usr_awaiting_status_id']);
+    sendMessage($chat_id, "🔍 Send your <b>Order ID</b> to check status:");
+    exit();
+}
+
+if ($user_state['step'] == 'usr_awaiting_status_id') {
+    $res = callSmmGenApi('status', ['order' => intval($text)]);
+    $msg = isset($res['status']) ? "⚙️ <b>Order Status:</b> {$res['status']}\n💵 <b>Charge:</b> \${$res['charge']}\n📊 <b>Remains:</b> {$res['remains']}" : "❌ Order ID not found.";
+    setUserState($chat_id, ['step' => 'none']);
+    sendMessage($chat_id, $msg, $main_keyboard);
+    exit();
+}
+
+// ♻️ REFILL ORDER
+if ($text == "♻️ Refill Order") {
+    setUserState($chat_id, ['step' => 'usr_awaiting_refill_id']);
+    sendMessage($chat_id, "♻️ Send your <b>Order ID</b> to request a refill:");
+    exit();
+}
+
+if ($user_state['step'] == 'usr_awaiting_refill_id') {
+    $res = callSmmGenApi('refill', ['order' => intval($text)]);
+    $msg = isset($res['refill']) ? "✅ <b>Refill Requested!</b> Refill ID: <code>{$res['refill']}</code>" : "❌ Refill Failed: " . ($res['error'] ?? "Not eligible for refill.");
+    setUserState($chat_id, ['step' => 'none']);
+    sendMessage($chat_id, $msg, $main_keyboard);
+    exit();
+}
+?>
