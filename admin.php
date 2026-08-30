@@ -1,7 +1,7 @@
 <?php
 // ==================== [ CONFIG & HELPERS ] ====================
 // ⚠️ বট টোকেন ও এপিআই কি রিসেট করে এখানে বসান!
-$bot_token   = "8766260416:AAEbwMNKxbd0x1e_2FJbho7osbXC6oXRvwE"; 
+$bot_token   = "8998188048:AAFLvJ7xkydWpTPlskOIM4tiCwmVGPAbOZA"; 
 $smm_api_url = "https://my.smmgen.com/api/v2";                 
 $smm_api_key = "2e53b57414dc722db3e2e2f9aaf723dc";             
 
