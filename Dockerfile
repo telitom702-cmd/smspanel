@@ -4,4 +4,4 @@ WORKDIR /app
 
 COPY . /app
 
-CMD ["php", "bot.php"]
+CMD ["php", "-d", "display_errors=1", "bot.php"]
